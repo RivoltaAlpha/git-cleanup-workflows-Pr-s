@@ -12,3 +12,4 @@ chore: bump version to 1.0.0
 chore: update changelog for v1.0
 wip: experimental GraphQL layer setup
 wip: schema draft for user queries
+wip: resolver stubs
