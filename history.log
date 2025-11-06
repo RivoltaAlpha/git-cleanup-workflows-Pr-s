@@ -3,3 +3,4 @@ feat: add login form
 feat: add JWT token validation
 feat: integrate Stripe SDK
 feat: add webhook handler for payments
+fix: patch SQL injection in /api/users endpoint
