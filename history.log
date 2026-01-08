@@ -1,3 +1,5 @@
 branch: develop
 feat: add login form
 feat: add JWT token validation
+feat: integrate Stripe SDK
+feat: add webhook handler for payments
