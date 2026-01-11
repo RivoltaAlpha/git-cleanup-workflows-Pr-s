@@ -6,3 +6,4 @@ feat: add webhook handler for payments
 fix: patch SQL injection in /api/users endpoint
 fix: sanitize HTML output to prevent XSS
 fix: add CSP headers
+fix: correct post-login redirect to dashboard
