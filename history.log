@@ -12,3 +12,4 @@ chore: bump version to 1.0.0
 chore: update changelog for v1.0
 feat: add dark mode toggle to settings
 feat: persist dark mode preference in localStorage
+feat: apply dark mode to all components
