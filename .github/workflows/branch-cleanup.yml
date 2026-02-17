@@ -1,0 +1,222 @@
+name: Branch Cleanup Automation
+
+on:
+  schedule:
+    # Saturday at 10 AM Nairobi time (UTC+3)
+    - cron: '0 7 * * 6'
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  branch-cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch all branches and history
+          
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+      - name: Install GitHub CLI
+        run: |
+          type -p curl >/dev/null || (sudo apt update && sudo apt install curl -y)
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt update
+          sudo apt install gh -y
+          
+      - name: Authenticate GitHub CLI
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
+        
+      - name: Export Current Branch State
+        run: |
+          mkdir -p cleanup-reports
+          DATE=$(date +%Y-%m-%d)
+          git branch -r --format='%(refname:short)|%(creatordate:iso8601)|%(authorname)' | grep -v 'HEAD' > "cleanup-reports/all-branches-${DATE}.txt"
+          echo "Branch export completed: cleanup-reports/all-branches-${DATE}.txt"
+          
+      - name: Identify Branches for Cleanup
+        id: identify
+        run: |
+          DATE=$(date +%Y-%m-%d)
+          CLEANUP_LIST="cleanup-reports/branches-to-delete-${DATE}.txt"
+          NOTIFICATION_LIST="cleanup-reports/branches-to-notify-${DATE}.txt"
+          
+          # Clear previous files
+          > "$CLEANUP_LIST"
+          > "$NOTIFICATION_LIST"
+          
+          # Get all remote branches except protected ones
+          git fetch --all
+          
+          for branch in $(git branch -r | grep -v 'HEAD' | grep -v 'origin/develop' | grep -v 'origin/test' | grep -v 'origin/production' | sed 's/origin\///'); do
+            # Skip protected branches
+            if [[ "$branch" == "develop" || "$branch" == "test" || "$branch" == "production" ]]; then
+              continue
+            fi
+            
+            # Check if branch has been merged to develop
+            MERGED=$(git branch -r --merged origin/develop | grep "origin/$branch" || echo "")
+            
+            # Get last commit date
+            LAST_COMMIT_DATE=$(git log -1 --format=%ci "origin/$branch" 2>/dev/null || echo "")
+            
+            if [[ -z "$LAST_COMMIT_DATE" ]]; then
+              continue
+            fi
+            
+            # Calculate days since last commit
+            LAST_COMMIT_TIMESTAMP=$(date -d "$LAST_COMMIT_DATE" +%s)
+            CURRENT_TIMESTAMP=$(date +%s)
+            DAYS_OLD=$(( ($CURRENT_TIMESTAMP - $LAST_COMMIT_TIMESTAMP) / 86400 ))
+            
+            # Check if branch is tagged
+            TAGGED=$(git tag --contains "origin/$branch" 2>/dev/null || echo "")
+            
+            # Decision logic based on retention strategy
+            if [[ -n "$MERGED" ]]; then
+              # Merged branches
+              if [[ "$branch" == release/* ]]; then
+                # Keep release branches forever
+                continue
+              elif [[ "$branch" == hotfix/* ]] && [[ $DAYS_OLD -gt 90 ]]; then
+                # Delete hotfix branches older than 90 days
+                if [[ -z "$TAGGED" ]]; then
+                  echo "origin/$branch|$DAYS_OLD|merged|hotfix-expired" >> "$CLEANUP_LIST"
+                fi
+              elif [[ "$branch" == feature/* ]] || [[ "$branch" == bugfix/* ]]; then
+                # Delete feature/bugfix branches older than 30 days if not tagged
+                if [[ $DAYS_OLD -gt 30 ]] && [[ -z "$TAGGED" ]]; then
+                  echo "origin/$branch|$DAYS_OLD|merged|feature-expired" >> "$CLEANUP_LIST"
+                fi
+              fi
+            else
+              # Unmerged branches
+              if [[ $DAYS_OLD -gt 90 ]]; then
+                # Notify for stale unmerged branches
+                echo "origin/$branch|$DAYS_OLD|unmerged|stale" >> "$NOTIFICATION_LIST"
+              fi
+            fi
+          done
+          
+          echo "cleanup_list=$CLEANUP_LIST" >> $GITHUB_OUTPUT
+          echo "notification_list=$NOTIFICATION_LIST" >> $GITHUB_OUTPUT
+          echo "date=$DATE" >> $GITHUB_OUTPUT
+          
+      - name: Create Notification Issue for Stale Branches
+        if: hashFiles('cleanup-reports/branches-to-notify-*.txt') != ''
+        run: |
+          DATE="${{ steps.identify.outputs.date }}"
+          NOTIFICATION_LIST="${{ steps.identify.outputs.notification_list }}"
+          
+          if [[ ! -s "$NOTIFICATION_LIST" ]]; then
+            echo "No branches to notify about"
+            exit 0
+          fi
+          
+          # Create issue body
+          ISSUE_BODY="## Stale Branch Cleanup Notification - $DATE\n\n"
+          ISSUE_BODY+="The following unmerged branches have been inactive for more than 90 days and are scheduled for deletion in 7 days:\n\n"
+          ISSUE_BODY+="| Branch | Days Inactive | Status |\n"
+          ISSUE_BODY+="|--------|---------------|--------|\n"
+          
+          while IFS='|' read -r branch days status reason; do
+            branch_name=$(echo "$branch" | sed 's/origin\///')
+            ISSUE_BODY+="| \`$branch_name\` | $days | $status |\n"
+          done < "$NOTIFICATION_LIST"
+          
+          ISSUE_BODY+="\n### Action Required\n\n"
+          ISSUE_BODY+="If you need to keep any of these branches:\n"
+          ISSUE_BODY+="1. **Tag the branch** if it contains important implementation: \`git tag -a v1.0-feature-name <commit> -m 'Description'\`\n"
+          ISSUE_BODY+="2. **Archive the branch** if it contains valuable experimental work: \`git branch archive/feature-name origin/feature-name\`\n"
+          ISSUE_BODY+="3. **Merge or close** the associated pull request\n"
+          ISSUE_BODY+="4. **Comment on this issue** with branches to preserve\n\n"
+          ISSUE_BODY+="Branches will be automatically deleted on $(date -d '+7 days' +%Y-%m-%d) unless action is taken.\n\n"
+          ISSUE_BODY+="---\n"
+          ISSUE_BODY+="*This is an automated notification from the Branch Cleanup workflow.*"
+          
+          # Create issue
+          echo -e "$ISSUE_BODY" | gh issue create \
+            --title "🧹 Stale Branch Cleanup - $DATE" \
+            --body-file - \
+            --label "branch-cleanup,automated"
+            
+      - name: Auto-delete Eligible Branches
+        if: hashFiles('cleanup-reports/branches-to-delete-*.txt') != ''
+        run: |
+          CLEANUP_LIST="${{ steps.identify.outputs.cleanup_list }}"
+          
+          if [[ ! -s "$CLEANUP_LIST" ]]; then
+            echo "No branches to delete"
+            exit 0
+          fi
+          
+          DELETED_COUNT=0
+          DELETED_BRANCHES=""
+          
+          while IFS='|' read -r branch days status reason; do
+            branch_name=$(echo "$branch" | sed 's/origin\///')
+            
+            # Tag the branch before deletion for audit trail
+            TAG_NAME="deleted/$(echo $branch_name | tr '/' '-')-$(date +%Y%m%d)"
+            git tag -a "$TAG_NAME" "origin/$branch_name" -m "Branch deleted by automation on $(date). Reason: $reason. Days old: $days"
+            git push origin "$TAG_NAME"
+            
+            # Delete the branch
+            git push origin --delete "$branch_name" && {
+              echo "✓ Deleted: $branch_name (tagged as $TAG_NAME)"
+              DELETED_COUNT=$((DELETED_COUNT + 1))
+              DELETED_BRANCHES+="- \`$branch_name\` → Tagged as \`$TAG_NAME\`\n"
+            } || {
+              echo "✗ Failed to delete: $branch_name"
+            }
+          done < "$CLEANUP_LIST"
+          
+          # Create summary issue if branches were deleted
+          if [[ $DELETED_COUNT -gt 0 ]]; then
+            DATE="${{ steps.identify.outputs.date }}"
+            SUMMARY="## Branch Cleanup Summary - $DATE\n\n"
+            SUMMARY+="**$DELETED_COUNT** branches were automatically deleted:\n\n"
+            SUMMARY+="$DELETED_BRANCHES\n"
+            SUMMARY+="### Recovery\n\n"
+            SUMMARY+="All deleted branches have been tagged for audit purposes. To recover a branch:\n"
+            SUMMARY+="\`\`\`bash\ngit checkout -b <branch-name> <tag-name>\n\`\`\`\n\n"
+            SUMMARY+="Tags are retained indefinitely and can be found with: \`git tag | grep deleted/\`\n\n"
+            SUMMARY+="---\n*Automated cleanup performed by Branch Cleanup workflow.*"
+            
+            echo -e "$SUMMARY" | gh issue create \
+              --title "✅ Branch Cleanup Completed - $DATE" \
+              --body-file - \
+              --label "branch-cleanup,completed"
+          fi
+          
+      - name: Upload Cleanup Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cleanup-reports-${{ steps.identify.outputs.date }}
+          path: cleanup-reports/
+          retention-days: 90
+          
+      - name: Cleanup Old Tags (Optional)
+        run: |
+          # Remove 'deleted/' tags older than 1 year
+          ONE_YEAR_AGO=$(date -d '1 year ago' +%s)
+          
+          for tag in $(git tag | grep '^deleted/'); do
+            TAG_DATE=$(git log -1 --format=%at "$tag" 2>/dev/null || echo "0")
+            
+            if [[ $TAG_DATE -lt $ONE_YEAR_AGO ]]; then
+              echo "Removing old tag: $tag"
+              git push origin --delete "$tag" || echo "Failed to delete tag: $tag"
+            fi
+          done
