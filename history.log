@@ -14,3 +14,4 @@ feat: email notification service
 feat: in-app toast notifications
 feat: notification preferences UI
 fix: add rate limiting to public API endpoints
+fix: configure rate limit thresholds per tier
